@@ -16,14 +16,22 @@ class LogitNormalSchedule:
   logsnr_max: float = 18.0
 
   def __call__(self, t: torch.Tensor) -> torch.Tensor:
-    t = t.to(torch.float64)
+    device = t.device
+    # The float64 warp (ndtri/expit) needs precision at the tails. MPS supports
+    # neither float64 nor these special functions, so there the warp runs on CPU
+    # (a fused `.to(cpu, float64)` would still cast on the MPS side first and
+    # raise, hence the split). Other devices keep the original on-device path.
+    if device.type == "mps":
+      t = t.cpu().to(torch.float64)
+    else:
+      t = t.to(torch.float64)
     z = torch.special.ndtri(t)
     y = self.mean + self.std * z
     t_ = torch.special.expit(y)
     t_ = 1 - t_
     t_min = 1.0 / (1 + math.exp(0.5 * self.logsnr_max))
     t_max = 1.0 / (1 + math.exp(0.5 * self.logsnr_min))
-    return t_.clamp(t_min, t_max).to(torch.float32)
+    return t_.clamp(t_min, t_max).to(device=device, dtype=torch.float32)
 
 
 def get_schedule_for_resolution(

@@ -83,7 +83,7 @@ def _load_fp8_text_encoder(
   )
   model = AutoModel.from_config(config, trust_remote_code=True)
   state_dict = _load_subfolder_state_dict(repo_id, text_encoder_subfolder, "model")
-  swap_linears_to_fp8(model, state_dict, compute_dtype=dtype)
+  swap_linears_to_fp8(model, state_dict, compute_dtype=dtype, device=device)
   # assign=True so unquantized params take the loaded dtype and the computed
   # rotary buffers (absent from the checkpoint) survive; tied weights, if any,
   # surface as benign missing keys.
@@ -168,7 +168,7 @@ def _build_transformer(
     # Weight-only FP8: cast the unquantized params to the compute dtype first,
     # then swap in Fp8Linear layers (which keep their weights as float8).
     model.to(dtype)
-    swap_linears_to_fp8(model, state_dict, compute_dtype=dtype)
+    swap_linears_to_fp8(model, state_dict, compute_dtype=dtype, device=device)
     load_fp8_state_dict(model, state_dict, device=device, dtype=dtype)
   else:
     model.load_state_dict(state_dict)

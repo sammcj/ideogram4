@@ -161,16 +161,32 @@ def is_fp8_state_dict(state_dict: dict[str, torch.Tensor]) -> bool:
   )
 
 
+def device_supports_fp8(device: torch.device) -> bool:
+  """Whether ``device`` can store and cast ``float8_e4m3fn`` tensors.
+
+  PyTorch's MPS (Apple Silicon) backend has no float8 support: it can neither
+  hold the dtype nor convert it, so any ``.to(mps)`` / ``.to(dtype)`` on a float8
+  tensor raises. On MPS the FP8 weights must be dequantized to the compute dtype
+  at load time instead. CUDA and CPU both handle float8 storage and casting.
+  """
+  return torch.device(device).type != "mps"
+
+
 class Fp8Linear(nn.Module):
   """Linear layer holding an e4m3 float8 weight + per-row float32 scale.
 
   The weight and scale are registered as buffers (not parameters) so they load
   via ``load_state_dict`` and are excluded from optimizer/grad machinery. The
   dequantized matmul runs in ``compute_dtype``.
+
+  When ``store_fp8`` is False the layer holds an already-dequantized weight in
+  ``compute_dtype`` and no scale buffer; this is the path for devices that can't
+  store float8 (MPS). The half-size checkpoint download is still used; only the
+  in-memory weight is expanded.
   """
 
   weight: torch.Tensor
-  weight_scale: torch.Tensor
+  weight_scale: torch.Tensor | None
   bias: torch.Tensor | None
 
   def __init__(
@@ -179,23 +195,39 @@ class Fp8Linear(nn.Module):
     out_features: int,
     bias: bool,
     compute_dtype: torch.dtype,
+    *,
+    store_fp8: bool = True,
   ) -> None:
     super().__init__()
     self.in_features = in_features
     self.out_features = out_features
     self.compute_dtype = compute_dtype
-    self.register_buffer(
-      "weight",
-      torch.empty(out_features, in_features, dtype=FP8_WEIGHT_DTYPE),
-    )
-    self.register_buffer("weight_scale", torch.empty(out_features, dtype=torch.float32))
+    self.store_fp8 = store_fp8
+    if store_fp8:
+      self.register_buffer(
+        "weight",
+        torch.empty(out_features, in_features, dtype=FP8_WEIGHT_DTYPE),
+      )
+      self.register_buffer(
+        "weight_scale", torch.empty(out_features, dtype=torch.float32)
+      )
+    else:
+      self.register_buffer(
+        "weight",
+        torch.empty(out_features, in_features, dtype=compute_dtype),
+      )
+      self.weight_scale = None
     if bias:
       self.register_buffer("bias", torch.empty(out_features, dtype=compute_dtype))
     else:
       self.bias = None
 
   def forward(self, x: torch.Tensor) -> torch.Tensor:
-    w = self.weight.to(x.dtype) * self.weight_scale.to(x.dtype).unsqueeze(1)
+    if self.store_fp8:
+      assert self.weight_scale is not None
+      w = self.weight.to(x.dtype) * self.weight_scale.to(x.dtype).unsqueeze(1)
+    else:
+      w = self.weight.to(x.dtype)
     bias = self.bias.to(x.dtype) if self.bias is not None else None
     return F.linear(x, w, bias)
 
@@ -204,6 +236,7 @@ def swap_linears_to_fp8(
   module: nn.Module,
   state_dict: dict[str, torch.Tensor],
   compute_dtype: torch.dtype,
+  device: torch.device,
   *,
   prefix: str = "",
 ) -> None:
@@ -211,8 +244,10 @@ def swap_linears_to_fp8(
 
   Gating on the presence of ``<name>.weight_scale`` means only layers that were
   actually quantized at save time are swapped; everything else loads normally in
-  the compute dtype.
+  the compute dtype. On devices that can't store float8 (MPS) the swapped layers
+  hold a dequantized ``compute_dtype`` weight instead (see ``Fp8Linear``).
   """
+  store_fp8 = device_supports_fp8(device)
   for name, child in list(module.named_children()):
     child_prefix = f"{prefix}{name}"
     if (
@@ -226,10 +261,13 @@ def swap_linears_to_fp8(
           child.out_features,
           bias=child.bias is not None,
           compute_dtype=compute_dtype,
+          store_fp8=store_fp8,
         ),
       )
     else:
-      swap_linears_to_fp8(child, state_dict, compute_dtype, prefix=f"{child_prefix}.")
+      swap_linears_to_fp8(
+        child, state_dict, compute_dtype, device, prefix=f"{child_prefix}."
+      )
 
 
 def load_fp8_state_dict(
@@ -255,13 +293,26 @@ def load_fp8_state_dict(
 
   ``strict=False`` downgrades missing keys to a warning (e.g. tied weights that a
   ``transformers`` model resolves itself); unexpected keys always raise.
+
+  On devices that can't store float8 (MPS) the FP8 weights are dequantized to
+  ``dtype`` here using their per-row scale, and the now-unused ``.weight_scale``
+  entries are dropped to match the dequantized ``Fp8Linear`` layout.
   """
+  store_fp8 = device_supports_fp8(device)
   prepared: dict[str, torch.Tensor] = {}
   for k, v in state_dict.items():
     if v.dtype == FP8_WEIGHT_DTYPE:
-      prepared[k] = v.to(device=device)
+      if store_fp8:
+        prepared[k] = v.to(device=device)
+      else:
+        # MPS can't cast float8, so dequantize on CPU before moving across.
+        scale = state_dict[k[: -len(".weight")] + FP8_SCALE_SUFFIX]
+        w = v.to(torch.float32) * scale.to(torch.float32).unsqueeze(1)
+        prepared[k] = w.to(device=device, dtype=dtype)
     elif k.endswith(FP8_SCALE_SUFFIX):
-      prepared[k] = v.to(device=device, dtype=torch.float32)
+      if store_fp8:
+        prepared[k] = v.to(device=device, dtype=torch.float32)
+      # else: folded into the dequantized weight above; drop the scale key.
     elif v.is_floating_point():
       prepared[k] = v.to(device=device, dtype=dtype)
     else:
