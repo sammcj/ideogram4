@@ -584,9 +584,16 @@ class Ideogram4Pipeline:
       device=self.device,
     )
 
+    # step_intervals is fixed for the whole generation, so warp it through the
+    # schedule once here rather than twice per step inside the loop.
+    schedule_values = [
+      float(schedule(step_intervals[j].unsqueeze(0)).item())
+      for j in range(num_steps + 1)
+    ]
+
     for i in range(num_steps - 1, -1, -1):
-      t_val = float(schedule(step_intervals[i + 1].unsqueeze(0)).item())
-      s_val = float(schedule(step_intervals[i].unsqueeze(0)).item())
+      t_val = schedule_values[i + 1]
+      s_val = schedule_values[i]
       t = torch.full((batch_size,), t_val, dtype=torch.float32, device=self.device)
 
       pos_z = torch.cat([text_z_padding, z], dim=1)
