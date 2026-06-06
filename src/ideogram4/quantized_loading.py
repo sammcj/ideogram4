@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import warnings
 
 import bitsandbytes as bnb
@@ -161,15 +162,25 @@ def is_fp8_state_dict(state_dict: dict[str, torch.Tensor]) -> bool:
   )
 
 
+@functools.lru_cache(maxsize=None)
+def _device_type_supports_fp8(device_type: str) -> bool:
+  try:
+    torch.zeros(1, dtype=FP8_WEIGHT_DTYPE, device=device_type).to(torch.float32)
+  except Exception:
+    return False
+  return True
+
+
 def device_supports_fp8(device: torch.device) -> bool:
   """Whether ``device`` can store and cast ``float8_e4m3fn`` tensors.
 
-  PyTorch's MPS (Apple Silicon) backend has no float8 support: it can neither
-  hold the dtype nor convert it, so any ``.to(mps)`` / ``.to(dtype)`` on a float8
-  tensor raises. On MPS the FP8 weights must be dequantized to the compute dtype
-  at load time instead. CUDA and CPU both handle float8 storage and casting.
+  Probed at runtime (cached per device type) rather than hard-coded, so the
+  answer matches the actual backend. PyTorch's MPS (Apple Silicon) backend has no
+  float8 support - it can neither hold the dtype nor convert it - so there the
+  FP8 weights must be dequantized to the compute dtype at load time instead. CUDA
+  and CPU both pass.
   """
-  return torch.device(device).type != "mps"
+  return _device_type_supports_fp8(torch.device(device).type)
 
 
 class Fp8Linear(nn.Module):
@@ -305,9 +316,10 @@ def load_fp8_state_dict(
       if store_fp8:
         prepared[k] = v.to(device=device)
       else:
-        # MPS can't cast float8, so dequantize on CPU before moving across.
+        # MPS can't cast float8, so dequantize on CPU (where the fp8 weights are
+        # loaded) before moving the result across to the target device.
         scale = state_dict[k[: -len(".weight")] + FP8_SCALE_SUFFIX]
-        w = v.to(torch.float32) * scale.to(torch.float32).unsqueeze(1)
+        w = v.cpu().to(torch.float32) * scale.cpu().to(torch.float32).unsqueeze(1)
         prepared[k] = w.to(device=device, dtype=dtype)
     elif k.endswith(FP8_SCALE_SUFFIX):
       if store_fp8:
