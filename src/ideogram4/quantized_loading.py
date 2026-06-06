@@ -176,9 +176,11 @@ def device_supports_fp8(device: torch.device) -> bool:
 
   Probed at runtime (cached per concrete device, e.g. ``cuda:0``, so a
   heterogeneous multi-device setup is checked individually) rather than
-  hard-coded. PyTorch's MPS (Apple Silicon) backend has no float8 support - it
-  can neither hold the dtype nor convert it - so there the FP8 weights must be
-  dequantized to the compute dtype at load time instead. CUDA and CPU both pass.
+  hard-coded, since float8 support can vary by PyTorch build and device. In
+  practice PyTorch's MPS (Apple Silicon) backend has no float8 support - it can
+  neither hold the dtype nor convert it - and fails the probe, so there the FP8
+  weights must be dequantized to the compute dtype at load time; CUDA and CPU
+  pass on current builds. The live probe is authoritative.
   """
   return _probe_fp8_support(str(torch.device(device)))
 
@@ -318,6 +320,10 @@ def load_fp8_state_dict(
       else:
         # MPS can't cast float8, so dequantize on CPU (where the fp8 weights are
         # loaded) before moving the result across to the target device.
+        if not k.endswith(".weight"):
+          raise RuntimeError(
+            f"unexpected FP8 tensor key {k!r} (expected it to end with '.weight')"
+          )
         scale_key = k[: -len(".weight")] + FP8_SCALE_SUFFIX
         if scale_key not in state_dict:
           raise RuntimeError(

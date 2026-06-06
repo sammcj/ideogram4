@@ -16,6 +16,11 @@ class LogitNormalSchedule:
   logsnr_max: float = 18.0
 
   def __call__(self, t: torch.Tensor) -> torch.Tensor:
+    """Map step positions to noise levels (inference-time, non-differentiable).
+
+    Called from the sampler loop under ``torch.no_grad`` and read out as Python
+    scalars, so the CPU detour taken on MPS never participates in autograd.
+    """
     device = t.device
     # The float64 warp (ndtri/expit) needs precision at the tails. MPS supports
     # neither float64 nor these special functions, so there the warp runs on CPU
