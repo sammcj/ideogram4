@@ -584,12 +584,10 @@ class Ideogram4Pipeline:
       device=self.device,
     )
 
-    # step_intervals is fixed for the whole generation, so warp it through the
-    # schedule once here rather than twice per step inside the loop.
-    schedule_values = [
-      float(schedule(step_intervals[j].unsqueeze(0)).item())
-      for j in range(num_steps + 1)
-    ]
+    # step_intervals is fixed for the whole generation, so warp the whole tensor
+    # through the schedule in one vectorized call (one device transfer) rather
+    # than calling it per element, twice per step, inside the loop.
+    schedule_values = schedule(step_intervals).tolist()
 
     for i in range(num_steps - 1, -1, -1):
       t_val = schedule_values[i + 1]

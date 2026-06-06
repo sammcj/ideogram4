@@ -163,9 +163,9 @@ def is_fp8_state_dict(state_dict: dict[str, torch.Tensor]) -> bool:
 
 
 @functools.lru_cache(maxsize=None)
-def _device_type_supports_fp8(device_type: str) -> bool:
+def _probe_fp8_support(device_str: str) -> bool:
   try:
-    torch.zeros(1, dtype=FP8_WEIGHT_DTYPE, device=device_type).to(torch.float32)
+    torch.zeros(1, dtype=FP8_WEIGHT_DTYPE, device=device_str).to(torch.float32)
   except Exception:
     return False
   return True
@@ -174,13 +174,13 @@ def _device_type_supports_fp8(device_type: str) -> bool:
 def device_supports_fp8(device: torch.device) -> bool:
   """Whether ``device`` can store and cast ``float8_e4m3fn`` tensors.
 
-  Probed at runtime (cached per device type) rather than hard-coded, so the
-  answer matches the actual backend. PyTorch's MPS (Apple Silicon) backend has no
-  float8 support - it can neither hold the dtype nor convert it - so there the
-  FP8 weights must be dequantized to the compute dtype at load time instead. CUDA
-  and CPU both pass.
+  Probed at runtime (cached per concrete device, e.g. ``cuda:0``, so a
+  heterogeneous multi-device setup is checked individually) rather than
+  hard-coded. PyTorch's MPS (Apple Silicon) backend has no float8 support - it
+  can neither hold the dtype nor convert it - so there the FP8 weights must be
+  dequantized to the compute dtype at load time instead. CUDA and CPU both pass.
   """
-  return _device_type_supports_fp8(torch.device(device).type)
+  return _probe_fp8_support(str(torch.device(device)))
 
 
 class Fp8Linear(nn.Module):
@@ -318,7 +318,12 @@ def load_fp8_state_dict(
       else:
         # MPS can't cast float8, so dequantize on CPU (where the fp8 weights are
         # loaded) before moving the result across to the target device.
-        scale = state_dict[k[: -len(".weight")] + FP8_SCALE_SUFFIX]
+        scale_key = k[: -len(".weight")] + FP8_SCALE_SUFFIX
+        if scale_key not in state_dict:
+          raise RuntimeError(
+            f"FP8 weight {k!r} has no matching scale {scale_key!r} in the checkpoint"
+          )
+        scale = state_dict[scale_key]
         w = v.cpu().to(torch.float32) * scale.cpu().to(torch.float32).unsqueeze(1)
         prepared[k] = w.to(device=device, dtype=dtype)
     elif k.endswith(FP8_SCALE_SUFFIX):
